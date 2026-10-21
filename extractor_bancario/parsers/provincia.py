@@ -44,9 +44,85 @@ def _extraer_texto(pdf_path):
     return lineas
 
 
+# ─── Formato "home banking" (página de movimientos impresa a PDF) ────────────
+#
+#     30/07/2025                                   -$ 60,86
+#     IMPUESTO DEBITO -LEY 25413
+#     Saldo: $ 1.065.891,65
+#
+# Cada movimiento es un bloque que empieza con la fecha. El importe puede
+# venir en la misma línea que la fecha o suelto en otra línea del bloque
+# (depende de cómo se extraiga el texto), y el saldo viene como "Saldo: $ ...".
+# Los movimientos vienen del más nuevo al más viejo.
+
+_MONTO_WEB = r"-?\s?\$\s?-?[\d.]+,\d{2}"
+FECHA_WEB_RE = re.compile(rf"^(\d{{2}}/\d{{2}}/\d{{4}})(?:\s+({_MONTO_WEB}))?$")
+MONTO_WEB_RE = re.compile(rf"^{_MONTO_WEB}$")
+SALDO_WEB_RE = re.compile(rf"^Saldo:\s*({_MONTO_WEB})$")
+
+
+def _es_formato_web(lineas):
+    return any(SALDO_WEB_RE.match(l.strip()) for l in lineas)
+
+
+def _es_ruido_web(ls):
+    return bool(
+        re.match(r"^\d{1,2}/\d{1,2}/\d{2}, \d{1,2}:\d{2}", ls)   # encabezado del navegador
+        or ls.startswith("http")
+        or re.match(r"^C[CA] (U\$S|\$) ", ls)                     # "CC $ 5020-53826/2"
+        or ls.startswith("Cuentas / Mis Cuentas")
+        or ls in ("Cuenta Movimientos", "Banco Provincia")
+    )
+
+
+def _parse_web(lineas):
+    movimientos = []
+    actual = None
+
+    def cerrar():
+        if actual and actual["importe"] is not None:
+            movimientos.append({
+                "fecha": actual["fecha"],
+                "fecha_valor": "",
+                "concepto": limpiar_espacios(" ".join(actual["desc"])),
+                "importe": actual["importe"],
+                "saldo": actual["saldo"],
+                "_es_saldo_inicial": False,
+            })
+
+    for linea in lineas:
+        ls = linea.strip()
+        if not ls or _es_ruido_web(ls):
+            continue
+
+        m_fecha = FECHA_WEB_RE.match(ls)
+        if m_fecha:
+            cerrar()
+            actual = {"fecha": m_fecha.group(1), "desc": [], "importe": None, "saldo": None}
+            if m_fecha.group(2):
+                actual["importe"] = parse_monto_ar(m_fecha.group(2))
+            continue
+        if actual is None:
+            continue
+
+        m_saldo = SALDO_WEB_RE.match(ls)
+        if m_saldo:
+            actual["saldo"] = parse_monto_ar(m_saldo.group(1))
+        elif MONTO_WEB_RE.match(ls) and actual["importe"] is None:
+            actual["importe"] = parse_monto_ar(ls)
+        else:
+            actual["desc"].append(ls)
+    cerrar()
+
+    movimientos.reverse()  # orden cronológico, igual que el extracto clásico
+    return movimientos
+
+
 def parse(pdf_path):
     """Devuelve lista de dicts: fecha, fecha_valor, concepto, importe, saldo."""
     lineas = _extraer_texto(pdf_path)
+    if _es_formato_web(lineas):
+        return _parse_web(lineas)
     movimientos = []
     cont_actual = None  # referencia al último movimiento, para líneas de continuación
 
