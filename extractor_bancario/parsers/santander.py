@@ -1,44 +1,30 @@
 """
-Parser de extractos de Banco Santander Argentina.
+Parser de extractos de Banco Santander Argentina (Cuenta Corriente, resumen mensual).
 
-NOTA IMPORTANTE: a diferencia de los parsers de Provincia, BBVA y Galicia
-(que fueron construidos y VALIDADOS con cuadre matemático exacto contra
-extractos reales), este parser de Santander fue construido sobre el patrón
-típico de extractos de cuenta corriente en pesos en Argentina (columnas:
-Fecha | Descripción/Concepto | Comprobante/Origen | Débito | Crédito | Saldo),
-pero no pudo probarse contra un PDF real de Santander.
+Formato observado (texto extraído línea a línea):
+    Fecha Comprobante Movimiento Débito Crédito Saldo en cuenta
+    01/07/25 Saldo Inicial $ 14.071.472,13
+    01/07/25 12145989 Pago comercios frst data visa nro.liq.
+    00335994/0012145989
+    $ 21.906,73 $ 14.078.727,83
+    01/07/25 Impuesto ley 25.413 debito 0,6% $ 87,91 $ 24.088.279,15
+    ...
+     Saldo total $ 1.351.907,79
 
-Si el resultado no cuadra bien al procesar un extracto real, lo más probable
-es que el formato exacto de columnas difiera (por ejemplo, columnas separadas
-de Débito/Crédito en vez de un único Importe con signo, o el orden Fecha
-Valor/Fecha Operación invertido). En ese caso avisame con un extracto de
-ejemplo (puede tener los montos editados/ficticios) y ajusto el parser.
+Cada movimiento termina en la línea que trae los dos montos: el importe (en la
+columna Débito o Crédito) y el saldo. Como en el texto no se distingue en qué
+columna estaba el importe, el signo se deduce de la variación del saldo.
+Si una fila no trae fecha, se usa la del movimiento anterior.
 """
 import re
 import pdfplumber
 from .utils import parse_monto_ar, limpiar_espacios
 
-FECHA_INICIO_RE = re.compile(r"^(\d{2}[/-]\d{2}[/-]\d{2,4})\s+(.*)$")
+_MONTO = r"-?\s?\$\s?-?[\d.]+,\d{2}"
 
-# Caso A: Débito y Crédito en columnas separadas: ... DEBITO CREDITO SALDO
-COLA_DOS_COLUMNAS_RE = re.compile(
-    r"^(.*?)\s+(-?[\d.,]+)?\s*[/|]?\s*(-?[\d.,]+)?\s+(-?[\d.,]+-?)\s*$"
-)
-# Caso B: Importe único con signo + Saldo
-COLA_UNA_COLUMNA_RE = re.compile(
-    r"^(.*?)\s+(-?[\d.,]+)\s+(-?[\d.,]+-?)\s*$"
-)
-
-ENCABEZADOS_IGNORAR = (
-    "Banco Santander",
-    "Resumen de Cuenta",
-    "Extracto de Cuenta",
-    "Fecha Descripcion",
-    "Fecha Concepto",
-    "Página",
-    "CUIT",
-    "SALDO ANTERIOR",
-)
+FECHA_RE = re.compile(r"^(\d{2}/\d{2}/\d{2,4})\s+(.*)$")
+MONTOS_RE = re.compile(rf"^(.*?)\s*({_MONTO})\s+({_MONTO})$")
+SALDO_INICIAL_RE = re.compile(rf"Saldo Inicial\s+({_MONTO})$")
 
 
 def _extraer_lineas(pdf_path):
@@ -50,66 +36,96 @@ def _extraer_lineas(pdf_path):
     return lineas
 
 
-def parse(pdf_path):
-    """Devuelve lista de dicts: fecha, concepto, importe, saldo.
+def _es_ruido(ls):
+    return bool(
+        ls.startswith("Cuenta Corriente N")
+        or ls.startswith("Fecha Comprobante")
+        or ls.startswith("* Salvo error")
+        or re.match(r"^\d+\s*-\s*\d+$", ls)          # número de página "3 - 13"
+    )
 
-    Intenta primero el formato de una sola columna de importe con signo
-    (similar a Provincia/Galicia); si no logra extraer movimientos, intenta
-    con dos columnas (débito/crédito separadas).
-    """
-    lineas = _extraer_lineas(pdf_path)
+
+def parse_lineas(lineas):
+    """Devuelve lista de dicts: fecha, concepto, importe, saldo."""
     movimientos = []
-    cont_actual = None
+    activo = False          # dentro de una tabla de movimientos en pesos
+    moneda = "ARS"
+    saldo_prev = None
+    fecha_actual = None
+    pendiente = []          # líneas de descripción del movimiento en curso
 
     for linea in lineas:
-        linea = linea.rstrip()
         ls = linea.strip()
         if not ls:
             continue
-        if any(ls.startswith(enc) for enc in ENCABEZADOS_IGNORAR):
-            cont_actual = None
+
+        if ls.startswith("Movimientos en pesos"):
+            moneda = "ARS"
+        elif ls.startswith("Movimientos en d"):
+            moneda = "USD"
+
+        if not activo:
+            m_ini = SALDO_INICIAL_RE.search(ls)
+            if m_ini and moneda == "ARS":
+                activo = True
+                saldo_prev = parse_monto_ar(m_ini.group(1))
+                m_fecha = FECHA_RE.match(ls)
+                fecha_actual = m_fecha.group(1) if m_fecha else None
+                pendiente = []
             continue
 
-        m_inicio = FECHA_INICIO_RE.match(ls)
-        if m_inicio:
-            fecha = m_inicio.group(1)
-            resto = m_inicio.group(2)
+        if ls.startswith("Saldo total"):
+            activo = False
+            continue
+        if _es_ruido(ls):
+            continue
 
-            m_cola = COLA_UNA_COLUMNA_RE.match(resto)
-            if m_cola:
-                concepto = limpiar_espacios(m_cola.group(1))
-                importe = parse_monto_ar(m_cola.group(2))
-                saldo = parse_monto_ar(m_cola.group(3))
-                mov = {
-                    "fecha": fecha,
-                    "concepto": concepto,
-                    "importe": importe,
-                    "saldo": saldo,
-                }
-                movimientos.append(mov)
-                cont_actual = mov
-            else:
-                cont_actual = None
+        m_fecha = FECHA_RE.match(ls)
+        if m_fecha:
+            fecha_actual = m_fecha.group(1)
+            ls = m_fecha.group(2)
+            pendiente = []
+
+        m_montos = MONTOS_RE.match(ls)
+        if not m_montos:
+            pendiente.append(ls)
+            continue
+
+        pendiente.append(m_montos.group(1))
+        monto = abs(parse_monto_ar(m_montos.group(2)))
+        saldo = parse_monto_ar(m_montos.group(3))
+        if saldo_prev is not None and saldo < saldo_prev:
+            importe = -monto
         else:
-            if cont_actual is not None:
-                cont_actual["concepto"] = limpiar_espacios(
-                    cont_actual["concepto"] + " " + ls
-                )
+            importe = monto
+
+        movimientos.append({
+            "fecha": fecha_actual,
+            "concepto": limpiar_espacios(" ".join(pendiente)),
+            "importe": importe,
+            "saldo": saldo,
+        })
+        saldo_prev = saldo
+        pendiente = []
 
     return movimientos
+
+
+def parse(pdf_path):
+    return parse_lineas(_extraer_lineas(pdf_path))
 
 
 def to_dataframe(pdf_path):
     import pandas as pd
     movs = parse(pdf_path)
-    filas = []
-    for m in movs:
-        filas.append({
+    return pd.DataFrame([
+        {
             "Fecha": m["fecha"],
             "Fecha Valor": "",
             "Descripción": m["concepto"],
             "Importe": m["importe"],
             "Saldo": m["saldo"],
             "Banco": "Santander",
-        })
-    return pd.DataFrame(filas)
+        }
+        for m in movs
+    ])
